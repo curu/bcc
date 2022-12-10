@@ -37,7 +37,7 @@ parser = argparse.ArgumentParser(
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=examples)
 parser.add_argument("min_us", nargs="?", default='10000',
-    help="minimum sleep time to trace, in us (default 10000)")
+    help="minimum block time to trace, in us (default 10000)")
 parser.add_argument("--ebpf", action="store_true",
     help=argparse.SUPPRESS)
 
@@ -83,10 +83,7 @@ struct data_t {
     u64 delta_us;
 };
 
-
 BPF_PERF_OUTPUT(events);
-
-
 """
 
 bpf_text_kprobe = """
@@ -138,7 +135,9 @@ int trace_finish_task_switch(struct pt_regs *ctx, struct rq *rq, struct task_str
     data.pid = pid;
     data.delta_us = delta_us;
     bpf_get_current_comm(&data.task, sizeof(data.task));
+#ifdef SHOW_STACK
     data.stack_id = stack_traces.get_stackid(ctx, 0);
+#endif
 
     // output
     events.perf_submit(ctx, &data, sizeof(data));
@@ -209,7 +208,9 @@ RAW_TRACEPOINT_PROBE(sched_switch)
         if (pid != 0) {
             if (!(FILTER_PID) && !(FILTER_TGID)) {
                 struct ts_stack_t ts_stack = { .ts = ts };
+#ifdef SHOW_STACK
                 ts_stack.stack_id = stack_traces.get_stackid(ctx, 0);
+#endif
                 start.update(&pid, &ts_stack);
             }
         }
@@ -219,7 +220,6 @@ RAW_TRACEPOINT_PROBE(sched_switch)
 """
 
 is_support_raw_tp = BPF.support_raw_tracepoint()
-is_support_raw_tp = False
 if is_support_raw_tp:
     bpf_text += bpf_text_raw_tp
 else:
@@ -262,11 +262,14 @@ def print_event(cpu, data, size):
 max_pid = int(open("/proc/sys/kernel/pid_max").read())
 
 # load BPF program
-b = BPF(text=bpf_text, cflags=["-DMAX_PID=%d" % max_pid])
+cflags = ["-DMAX_PID=%d" % max_pid]
+if args.stack:
+    cflags.append("-DSHOW_STACK")
+b = BPF(text=bpf_text, cflags=cflags)
 if not is_support_raw_tp:
     b.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$",
                     fn_name="trace_finish_task_switch")
-print("Tracing sleep latency higher than %d us" % min_us)
+print("Tracing block time longer higher than %d us" % min_us)
 print("%-8s %-5s %-16s %-7s %s" % ("TIME","CPU", "COMM", "TID", "LAT(us)"))
 
 stack_traces = b.get_table("stack_traces")
