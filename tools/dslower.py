@@ -61,15 +61,23 @@ bpf_text = """
 #define TASK_NOLOAD         0x0400
 #endif
 
-BPF_ARRAY(start, u64, MAX_PID);
+struct ts_stack_t {
+    u32 stack_id;
+    u64 ts;
+};
+BPF_ARRAY(start, struct ts_stack_t, MAX_PID);
 
 struct rq;
 
+BPF_STACK_TRACE(stack_traces, 4096);
+
 struct data_t {
     u32 pid;
+    u32 stack_id;
     char task[TASK_COMM_LEN];
     u64 delta_us;
 };
+
 
 BPF_PERF_OUTPUT(events);
 
@@ -87,19 +95,19 @@ static int trace_wakeup(CTX_TYPE *ctx, struct task_struct *p)
     u64 ts = bpf_ktime_get_ns();
 
     // fetch timestamp and calculate delta
-    tsp = start.lookup(&pid);
-    if ((tsp == 0) || (*tsp == 0)) {
+    struct ts_stack_t *ts_stack_p = start.lookup(&pid);
+    if ((ts_stack_p == 0) || (ts_stack_p->ts == 0)) {
         return 0;   // missed enqueue
     }
 
-    if(ts < *tsp){
+    if(ts < ts_stack_p->ts){
         //maybe time wrap
-        *tsp = 0;
+        ts_stack_p->ts = 0;
         return 0;
     }
 
-    delta_us = (ts - *tsp) / 1000;
-    *tsp = 0;
+    delta_us = (ts - ts_stack_p->ts) / 1000;
+    ts_stack_p->ts = 0;
 
     if (FILTER_US){
         return 0;
@@ -109,6 +117,7 @@ static int trace_wakeup(CTX_TYPE *ctx, struct task_struct *p)
     data.pid = pid;
     data.delta_us = delta_us;
     bpf_probe_read(&data.task, sizeof(data.task), p->comm);
+    data.stack_id = ts_stack_p->stack_id;
 
     // output
     events.perf_submit(ctx, &data, sizeof(data));
@@ -117,7 +126,7 @@ static int trace_wakeup(CTX_TYPE *ctx, struct task_struct *p)
 }
 
 
-static int trace_offcpu(struct task_struct *prev)
+static int trace_offcpu(CTX_TYPE *ctx, struct task_struct *prev)
 {
     u32 pid, tgid;
 
@@ -128,7 +137,9 @@ static int trace_offcpu(struct task_struct *prev)
         u64 ts = bpf_ktime_get_ns();
         if (pid != 0) {
             if (!(FILTER_PID) && !(FILTER_TGID)) {
-                start.update(&pid, &ts);
+                struct ts_stack_t ts_stack = { .ts = ts };
+                ts_stack.stack_id = stack_traces.get_stackid(ctx, 0);
+                start.update(&pid, &ts_stack);
             }
         }
     }
@@ -146,7 +157,7 @@ int trace_ttwu_do_wakeup(struct pt_regs *ctx, struct rq *rq, struct task_struct 
 
 int trace_run(struct pt_regs *ctx, struct rq *rq, struct task_struct *prev)
 {
-    return trace_offcpu(prev);
+    return trace_offcpu(ctx, prev);
 }
 """
 
@@ -162,7 +173,7 @@ RAW_TRACEPOINT_PROBE(sched_switch)
 {
     // TP_PROTO(bool preempt, struct task_struct *prev, struct task_struct *next)
     struct task_struct *prev = (struct task_struct *)ctx->args[1];
-    return trace_offcpu(prev);
+    return trace_offcpu(ctx, prev);
 }
 """
 
@@ -203,6 +214,9 @@ if debug or args.ebpf:
 def print_event(cpu, data, size):
     event = b["events"].event(data)
     print("%-8s [%03d] %-16s %-7s %d" % (strftime("%H:%M:%S"), cpu, event.task.decode('utf-8', 'replace'), event.pid, event.delta_us))
+    for addr in stack_traces.walk(event.stack_id):
+        sym = b.ksym(addr, show_offset=True).decode('utf-8', 'replace')
+        print("\t%s" % sym)
 
 max_pid = int(open("/proc/sys/kernel/pid_max").read())
 
@@ -212,9 +226,10 @@ if not is_support_raw_tp:
     b.attach_kprobe(event="ttwu_do_wakeup", fn_name="trace_ttwu_do_wakeup")
     b.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$",
                     fn_name="trace_run")
-
 print("Tracing sleep latency higher than %d us" % min_us)
 print("%-8s %-5s %-16s %-7s %s" % ("TIME","CPU", "COMM", "TID", "LAT(us)"))
+
+stack_traces = b.get_table("stack_traces")
 
 # read events
 b["events"].open_perf_buffer(print_event, page_cnt=64)
