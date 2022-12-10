@@ -4,7 +4,7 @@
 # dslower    trace process block in D state
 #               For Linux, uses BCC, eBPF.
 #
-# This script traces high delay between process sleep in D state and been woken
+# This script traces long process block time(in D state)
 #
 # USAGE: dslower [-p PID] [-t TID] [-P] [min_us]
 #
@@ -25,11 +25,12 @@ from time import strftime
 
 # arguments
 examples = """examples:
-    ./dslower         # trace run queue latency higher than 10000 us (default)
-    ./dslower 1000    # trace run queue latency higher than 1000 us
+    ./dslower         # trace process block longer than 10000 us (default)
+    ./dslower 1000    # trace process block longer than 1000 us
     ./dslower -p 123  # trace pid 123
     ./dslower -t 123  # trace tid 123 (use for threads only)
-    ./dslower -P      # also show previous task comm and TID
+    ./dslower -s  # also show stack trace
+
 """
 parser = argparse.ArgumentParser(
     description="Trace high run queue latency",
@@ -45,6 +46,10 @@ thread_group.add_argument("-p", "--pid", metavar="PID", dest="pid",
     help="trace this PID only", type=int)
 thread_group.add_argument("-t", "--tid", metavar="TID", dest="tid",
     help="trace this TID only", type=int)
+
+parser.add_argument("-s", "--stack", action="store_true",
+    help="also show block stack trace")
+
 args = parser.parse_args()
 
 min_us = int(args.min_us)
@@ -82,9 +87,73 @@ struct data_t {
 BPF_PERF_OUTPUT(events);
 
 
-// calc wakup delay
-static int trace_wakeup(CTX_TYPE *ctx, struct task_struct *p)
+"""
+
+bpf_text_kprobe = """
+//int trace_finish_task_switch(struct pt_regs *ctx, struct task_struct *prev)
+int trace_finish_task_switch(struct pt_regs *ctx, struct rq *rq, struct task_struct *prev)
 {
+    u32 pid, tgid;
+    u64 ts = bpf_ktime_get_ns();
+
+    // prev task go to sleep
+    if ((prev->STATE_FIELD & TASK_UNINTERRUPTIBLE) && !(prev->STATE_FIELD & TASK_NOLOAD)) {
+        pid = prev->pid;
+        tgid = prev->tgid;
+        if (pid != 0) {
+            if (!(FILTER_PID) && !(FILTER_TGID)) {
+                struct ts_stack_t ts_stack = { .ts = ts };
+                start.update(&pid, &ts_stack);
+            }
+        }
+    }
+
+    /* finish_task_switch already switched stack, so we can't get stack trace of prev task
+     *  we need to get the stack after the same task sched in again.
+     *  the accurate delta should between sched_swith -> sched_wakeup
+     *  the delta caculated here is longer than real block time, this is indeed  block_time + run_delay
+    */
+    pid = bpf_get_current_pid_tgid();
+    struct ts_stack_t *ts_stack_p = start.lookup(&pid);
+
+    u64 delta_us;
+    if ((ts_stack_p == 0) || (ts_stack_p->ts == 0)) {
+        return 0;   // missed enqueue
+    }
+
+    if(ts < ts_stack_p->ts){
+        //maybe time wrap
+        ts_stack_p->ts = 0;
+        return 0;
+    }
+
+    delta_us = (ts - ts_stack_p->ts) / 1000;
+    ts_stack_p->ts = 0;
+
+    if (FILTER_US){
+        return 0;
+    }
+
+    struct data_t data = {};
+    data.pid = pid;
+    data.delta_us = delta_us;
+    bpf_get_current_comm(&data.task, sizeof(data.task));
+    data.stack_id = stack_traces.get_stackid(ctx, 0);
+
+    // output
+    events.perf_submit(ctx, &data, sizeof(data));
+
+    return 0;
+
+}
+"""
+
+bpf_text_raw_tp = """
+RAW_TRACEPOINT_PROBE(sched_wakeup)
+{
+    // TP_PROTO(struct task_struct *p)
+    struct task_struct *p = (struct task_struct *)ctx->args[0];
+
     u64 *tsp, delta_us;
     u32 pid = p->pid;
     u32 tgid = p->tgid;
@@ -125,9 +194,11 @@ static int trace_wakeup(CTX_TYPE *ctx, struct task_struct *p)
     return 0;
 }
 
-
-static int trace_offcpu(CTX_TYPE *ctx, struct task_struct *prev)
+RAW_TRACEPOINT_PROBE(sched_switch)
 {
+    // TP_PROTO(bool preempt, struct task_struct *prev, struct task_struct *next)
+    struct task_struct *prev = (struct task_struct *)ctx->args[1];
+
     u32 pid, tgid;
 
     // prev task go to sleep
@@ -143,46 +214,15 @@ static int trace_offcpu(CTX_TYPE *ctx, struct task_struct *prev)
             }
         }
     }
-
     return 0;
 }
 """
 
-bpf_text_kprobe = """
-int trace_ttwu_do_wakeup(struct pt_regs *ctx, struct rq *rq, struct task_struct *p,
-    int wake_flags)
-{
-    return trace_wakeup(ctx, p);
-}
-
-int trace_run(struct pt_regs *ctx, struct rq *rq, struct task_struct *prev)
-{
-    return trace_offcpu(ctx, prev);
-}
-"""
-
-bpf_text_raw_tp = """
-RAW_TRACEPOINT_PROBE(sched_wakeup)
-{
-    // TP_PROTO(struct task_struct *p)
-    struct task_struct *p = (struct task_struct *)ctx->args[0];
-    return trace_wakeup(ctx, p);
-}
-
-RAW_TRACEPOINT_PROBE(sched_switch)
-{
-    // TP_PROTO(bool preempt, struct task_struct *prev, struct task_struct *next)
-    struct task_struct *prev = (struct task_struct *)ctx->args[1];
-    return trace_offcpu(ctx, prev);
-}
-"""
-
 is_support_raw_tp = BPF.support_raw_tracepoint()
+is_support_raw_tp = False
 if is_support_raw_tp:
-    bpf_text = bpf_text.replace('CTX_TYPE', 'struct bpf_raw_tracepoint_args')
     bpf_text += bpf_text_raw_tp
 else:
-    bpf_text = bpf_text.replace('CTX_TYPE', 'struct pt_regs')
     bpf_text += bpf_text_kprobe
 
 # code substitutions
@@ -214,18 +254,18 @@ if debug or args.ebpf:
 def print_event(cpu, data, size):
     event = b["events"].event(data)
     print("%-8s [%03d] %-16s %-7s %d" % (strftime("%H:%M:%S"), cpu, event.task.decode('utf-8', 'replace'), event.pid, event.delta_us))
-    for addr in stack_traces.walk(event.stack_id):
-        sym = b.ksym(addr, show_offset=True).decode('utf-8', 'replace')
-        print("\t%s" % sym)
+    if args.stack:
+        for addr in stack_traces.walk(event.stack_id):
+            sym = b.ksym(addr, show_offset=True).decode('utf-8', 'replace')
+            print("\t%s" % sym)
 
 max_pid = int(open("/proc/sys/kernel/pid_max").read())
 
 # load BPF program
 b = BPF(text=bpf_text, cflags=["-DMAX_PID=%d" % max_pid])
 if not is_support_raw_tp:
-    b.attach_kprobe(event="ttwu_do_wakeup", fn_name="trace_ttwu_do_wakeup")
     b.attach_kprobe(event_re="^finish_task_switch$|^finish_task_switch\.isra\.\d$",
-                    fn_name="trace_run")
+                    fn_name="trace_finish_task_switch")
 print("Tracing sleep latency higher than %d us" % min_us)
 print("%-8s %-5s %-16s %-7s %s" % ("TIME","CPU", "COMM", "TID", "LAT(us)"))
 
