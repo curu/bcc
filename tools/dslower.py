@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # @lint-avoid-python-3-compatibility-imports
 #
-# dslower    trace process block in D state
+# dslower    Trace process block on D state time. (uninterruptible sleep)
 #               For Linux, uses BCC, eBPF.
 #
 # This script traces long process block time(in D state)
@@ -33,7 +33,7 @@ examples = """examples:
 
 """
 parser = argparse.ArgumentParser(
-    description="Trace high run queue latency",
+    description="Trace process block on D state time. (uninterruptible sleep)",
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=examples)
 parser.add_argument("min_us", nargs="?", default='10000',
